@@ -1,0 +1,1806 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [ "main", "master" ]
+  push:
+    branches: [ "main", "master" ]
+
+jobs:
+  api-smoke:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: rba
+          POSTGRES_PASSWORD: rba
+          POSTGRES_DB: rba
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U rba -d rba"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # Matches your app configuration
+      DATABASE_URL: postgresql+psycopg://rba:rba@localhost:5432/rba
+      ENV: ci
+      LOG_LEVEL: INFO
+      ARTIFACT_DIR: var/artifacts
+      # Optional: consistent user scoping for tests
+      X_USER_ID: 00000000-0000-0000-0000-000000000001
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install API dependencies
+        working-directory: services/api
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run migrations
+        working-directory: services/api
+        run: |
+          alembic upgrade head
+
+      - name: Start API (uvicorn)
+        working-directory: services/api
+        run: |
+          nohup uvicorn app.main:app --host 0.0.0.0 --port 8000 > uvicorn.log 2>&1 &
+          # Basic wait loop (no external deps)
+          for i in {1..30}; do
+            if curl -fsS http://localhost:8000/health > /dev/null; then
+              echo "API is up"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "API failed to start"
+          echo "---- uvicorn.log ----"
+          cat uvicorn.log
+          exit 1
+
+      - name: Smoke tests (health + tailor + list + export pdf)
+        working-directory: services/api
+        run: |
+          # 1) Health
+          curl -fsS http://localhost:8000/health | python -c "import sys,json; print(json.load(sys.stdin))"
+
+          # 2) Create a tailor run
+          RUN_JSON=$(curl -fsS -X POST http://localhost:8000/v1/tailor \
+            -H "Content-Type: application/json" \
+            -H "X-User-Id: ${X_USER_ID}" \
+            -d '{"resume_text":"John Doe\nSecurity Analyst\nExperience: Incident triage and EDR response.","job_text":"We need a Security Analyst with SIEM, incident response, and EDR experience.","prompt_version":"v1"}')
+
+          RUN_ID=$(python -c "import json,sys; print(json.loads(sys.argv[1])['id'])" "$RUN_JSON")
+          echo "RUN_ID=$RUN_ID"
+
+          # 3) List runs (expects pagination meta + no raw text)
+          LIST_JSON=$(curl -fsS -H "X-User-Id: ${X_USER_ID}" http://localhost:8000/v1/tailor-runs)
+          python - << 'PY'
+          import json,sys
+          d=json.loads(sys.stdin.read())
+          assert "items" in d and "meta" in d, "Missing items/meta in runs list response"
+          assert isinstance(d["items"], list), "items must be a list"
+          assert "total" in d["meta"], "meta.total missing"
+          print("runs list meta:", d["meta"])
+          PY <<< "$LIST_JSON"
+
+          # 4) Export PDF
+          EXPORT_JSON=$(curl -fsS -X POST \
+            -H "X-User-Id: ${X_USER_ID}" \
+            http://localhost:8000/v1/tailor-runs/${RUN_ID}/export/pdf)
+
+          ARTIFACT_ID=$(python -c "import json,sys; print(json.loads(sys.argv[1])['artifact_id'])" "$EXPORT_JSON")
+          DOWNLOAD_URL=$(python -c "import json,sys; print(json.loads(sys.argv[1])['download_url'])" "$EXPORT_JSON")
+          echo "ARTIFACT_ID=$ARTIFACT_ID"
+          echo "DOWNLOAD_URL=$DOWNLOAD_URL"
+
+          # 5) Download artifact and confirm it looks like a PDF
+          curl -fsS -L -H "X-User-Id: ${X_USER_ID}" "http://localhost:8000${DOWNLOAD_URL}" -o artifact.pdf
+          python - << 'PY'
+          with open("artifact.pdf","rb") as f:
+            head=f.read(5)
+          assert head == b"%PDF-", f"Expected PDF header, got {head!r}"
+          print("PDF download OK")
+          PY
+
+      - name: Show API log on failure
+        if: failure()
+        working-directory: services/api
+        run: |
+          echo "---- uvicorn.log ----"
+          test -f uvicorn.log && cat uvicorn.log || echo "No uvicorn.log found"
+Notes
+If your default branch is only main (or only master), you can remove the other from the workflow triggers—keeping both is fine.
+
+This assumes your API requirements include: alembic, psycopg[binary], python-docx, and reportlab (for PDF export).
+
+If you later replace X-User-Id with JWT, you’ll update the workflow to acquire a token and pass Authorization: Bearer … instead.
+
+1) Add dev dependencies
+
+Create services/api/requirements-dev.txt:
+
+ruff==0.8.4
+black==24.10.0
+mypy==1.13.0
+types-requests==2.32.0.20241016
+
+
+(You can keep versions unpinned if you prefer; pinned is more stable in CI.)
+
+2) Add config (recommended): services/api/pyproject.toml
+
+If you already have a pyproject.toml, merge these sections.
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+fix = false
+
+[tool.ruff.lint]
+select = [
+  "E",   # pycodestyle errors
+  "F",   # pyflakes
+  "I",   # import sorting
+  "B",   # bugbear
+  "UP",  # pyupgrade
+]
+ignore = [
+  "E501", # line length handled by black
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+check_untyped_defs = true
+no_implicit_optional = true
+ignore_missing_imports = true
+pretty = true
+
+
+Why this config works well for MVP:
+
+Ruff catches real issues quickly (imports, unused vars, obvious bugs)
+
+Black standardizes style (no debates)
+
+Mypy runs in “helpful but not punishing” mode
+
+3) Update GitHub Actions to include a second job
+
+Edit .github/workflows/ci.yml and add this new job alongside api-smoke:
+
+  python-quality:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install quality tooling
+        working-directory: services/api
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+
+      - name: Ruff (lint)
+        working-directory: services/api
+        run: |
+          ruff check .
+
+      - name: Black (format check)
+        working-directory: services/api
+        run: |
+          black --check .
+
+      - name: Mypy (type check)
+        working-directory: services/api
+        run: |
+          mypy app
+
+Optional: make smoke tests depend on quality checks
+
+If you want CI to fail fast on lint before spinning up Postgres, add:
+
+  api-smoke:
+    needs: python-quality
+
+4) Local commands (nice for README)
+
+From services/api:
+
+pip install -r requirements.txt -r requirements-dev.txt
+ruff check .
+black .
+mypy app
+
+Option A (Recommended): Black + Ruff (lint)
+1) Add dev dependency
+
+services/api/requirements-dev.txt (if you don’t already have it):
+
+pre-commit==3.8.0
+ruff==0.8.4
+black==24.10.0
+mypy==1.13.0
+types-requests==2.32.0.20241016
+
+2) Add pre-commit config (repo root)
+
+Create: .pre-commit-config.yaml
+
+repos:
+  # Basic hygiene (fast, language-agnostic)
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: check-yaml
+      - id: check-merge-conflict
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+
+  # Ruff (lint)
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.8.4
+    hooks:
+      - id: ruff
+        name: ruff (lint)
+        files: ^services/api/
+        args: ["--config", "services/api/pyproject.toml"]
+
+  # Black (format)
+  - repo: https://github.com/psf/black
+    rev: 24.10.0
+    hooks:
+      - id: black
+        name: black (format)
+        files: ^services/api/
+        args: ["--config", "services/api/pyproject.toml"]
+
+  # Optional: mypy (type check) — keep enabled only if it’s clean and stable
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.13.0
+    hooks:
+      - id: mypy
+        name: mypy (type check)
+        files: ^services/api/app/
+        additional_dependencies:
+          - sqlalchemy
+          - psycopg[binary]
+          - fastapi
+          - pydantic
+          - alembic
+          - python-dotenv
+          - python-docx
+          - reportlab
+
+3) Ensure your formatter/linter settings live in services/api/pyproject.toml
+
+If you don’t have it yet, add:
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E","F","I","B","UP"]
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app"]
+
+[tool.mypy]
+python_version = "3.11"
+check_untyped_defs = true
+no_implicit_optional = true
+ignore_missing_imports = true
+pretty = true
+
+4) Install hooks locally
+
+From repo root:
+
+cd services/api
+pip install -r requirements.txt -r requirements-dev.txt
+cd ../..
+pre-commit install
+pre-commit run --all-files
+
+5) Match CI (“CI”) to this choice
+
+Your python-quality job should include:
+
+ruff check .
+
+black --check .
+
+mypy app (optional)
+
+This aligns exactly with the pre-commit hooks above.
+
+Option B (Lean Toolchain): Ruff format + Ruff (lint)
+
+Use this if you want one tool to format + lint.
+
+1) Dev deps
+
+services/api/requirements-dev.txt:
+
+pre-commit==3.8.0
+ruff==0.8.4
+mypy==1.13.0
+types-requests==2.32.0.20241016
+
+2) Pre-commit config (repo root)
+
+Create: .pre-commit-config.yaml
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: check-yaml
+      - id: check-merge-conflict
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.8.4
+    hooks:
+      - id: ruff
+        name: ruff (lint)
+        files: ^services/api/
+        args: ["--config", "services/api/pyproject.toml"]
+      - id: ruff-format
+        name: ruff (format)
+        files: ^services/api/
+        args: ["--config", "services/api/pyproject.toml"]
+
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.13.0
+    hooks:
+      - id: mypy
+        name: mypy (type check)
+        files: ^services/api/app/
+        additional_dependencies:
+          - sqlalchemy
+          - psycopg[binary]
+          - fastapi
+          - pydantic
+          - alembic
+          - python-dotenv
+          - python-docx
+          - reportlab
+
+3) services/api/pyproject.toml
+
+You can keep the Ruff and Mypy sections from Option A. Black section can be removed.
+
+4) Local install
+
+Same:
+
+cd services/api
+pip install -r requirements.txt -r requirements-dev.txt
+cd ../..
+pre-commit install
+pre-commit run --all-files
+
+5) CI alignment
+
+Update python-quality job to run:
+
+ruff check .
+
+ruff format --check .
+
+mypy app (optional)
+
+1) .pre-commit-config.yaml (repo root)
+repos:
+  # Basic hygiene (fast, language-agnostic)
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: check-yaml
+      - id: check-merge-conflict
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+
+  # Ruff (lint)
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.8.4
+    hooks:
+      - id: ruff
+        name: ruff (lint)
+        files: ^services/api/
+        args: ["--config", "services/api/pyproject.toml"]
+
+  # Black (format)
+  - repo: https://github.com/psf/black
+    rev: 24.10.0
+    hooks:
+      - id: black
+        name: black (format)
+        files: ^services/api/
+        args: ["--config", "services/api/pyproject.toml"]
+
+  # Mypy (type check) — kept conservative; aligned with CI
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.13.0
+    hooks:
+      - id: mypy
+        name: mypy (type check)
+        files: ^services/api/app/
+        pass_filenames: false
+        args: ["--config-file", "services/api/pyproject.toml", "services/api/app"]
+        additional_dependencies:
+          - sqlalchemy
+          - psycopg[binary]
+          - fastapi
+          - pydantic
+          - alembic
+          - python-dotenv
+          - python-docx
+          - reportlab
+
+2) services/api/requirements-dev.txt
+pre-commit==3.8.0
+ruff==0.8.4
+black==24.10.0
+mypy==1.13.0
+types-requests==2.32.0.20241016
+
+3) services/api/pyproject.toml
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = [
+  "E",   # pycodestyle errors
+  "F",   # pyflakes
+  "I",   # import sorting
+  "B",   # bugbear
+  "UP",  # pyupgrade
+]
+ignore = [
+  "E501", # line length handled by black
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_unused_configs = true
+check_untyped_defs = true
+no_implicit_optional = true
+ignore_missing_imports = true
+pretty = true
+
+4) Exact python-quality job snippet for your workflow named CI
+
+Add this job to .github/workflows/ci.yml (same level as api-smoke). It assumes your API lives under services/api.
+
+  python-quality:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies + tooling
+        working-directory: services/api
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+
+      - name: Ruff (lint)
+        working-directory: services/api
+        run: |
+          ruff check .
+
+      - name: Black (format check)
+        working-directory: services/api
+        run: |
+          black --check .
+
+      - name: Mypy (type check)
+        working-directory: services/api
+        run: |
+          mypy app
+
+Optional (recommended): make smoke tests depend on quality checks
+
+If you want api-smoke to run only after lint/format/type passes:
+
+  api-smoke:
+    needs: python-quality
+
+Local enablement commands (once)
+cd services/api
+pip install -r requirements.txt -r requirements-dev.txt
+cd ../..
+pre-commit install
+pre-commit run --all-files
+
+Pattern A: Your ci.yml already has api-smoke
+
+Add the python-quality job above or below api-smoke, then add needs: to api-smoke.
+
+1) Add this job block
+  python-quality:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies + tooling
+        working-directory: services/api
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+
+      - name: Ruff (lint)
+        working-directory: services/api
+        run: |
+          ruff check .
+
+      - name: Black (format check)
+        working-directory: services/api
+        run: |
+          black --check .
+
+      - name: Mypy (type check)
+        working-directory: services/api
+        run: |
+          mypy app
+
+2) Modify your existing api-smoke job header to include:
+  api-smoke:
+    needs: python-quality
+    runs-on: ubuntu-latest
+
+Pattern B: Your job is named something else (e.g., smoke, tests, backend)
+
+Add the same python-quality job, then change that job’s header to include needs: python-quality.
+
+Example:
+
+  backend:
+    needs: python-quality
+    runs-on: ubuntu-latest
+    ...
+
+Minimal full file example (reference)
+
+If you want a clean baseline, this is a complete ci.yml that includes both jobs and triggers on main and master:
+
+name: CI
+
+on:
+  pull_request:
+    branches: [ "main", "master" ]
+  push:
+    branches: [ "main", "master" ]
+
+jobs:
+  python-quality:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies + tooling
+        working-directory: services/api
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+
+      - name: Ruff (lint)
+        working-directory: services/api
+        run: ruff check .
+
+      - name: Black (format check)
+        working-directory: services/api
+        run: black --check .
+
+      - name: Mypy (type check)
+        working-directory: services/api
+        run: mypy app
+
+  api-smoke:
+    needs: python-quality
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: rba
+          POSTGRES_PASSWORD: rba
+          POSTGRES_DB: rba
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U rba -d rba"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgresql+psycopg://rba:rba@localhost:5432/rba
+      ARTIFACT_DIR: var/artifacts
+      X_USER_ID: 00000000-0000-0000-0000-000000000001
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install API dependencies
+        working-directory: services/api
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run migrations
+        working-directory: services/api
+        run: alembic upgrade head
+
+      - name: Start API (uvicorn)
+        working-directory: services/api
+        run: |
+          nohup uvicorn app.main:app --host 0.0.0.0 --port 8000 > uvicorn.log 2>&1 &
+          for i in {1..30}; do
+            if curl -fsS http://localhost:8000/health > /dev/null; then
+              echo "API is up"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "API failed to start"
+          cat uvicorn.log || true
+          exit 1
+
+      - name: Smoke tests
+        working-directory: services/api
+        run: |
+          curl -fsS http://localhost:8000/health > /dev/null
+
+          RUN_JSON=$(curl -fsS -X POST http://localhost:8000/v1/tailor \
+            -H "Content-Type: application/json" \
+            -H "X-User-Id: ${X_USER_ID}" \
+            -d '{"resume_text":"John Doe\nSecurity Analyst\nExperience: Incident triage and EDR response.","job_text":"We need a Security Analyst with SIEM, incident response, and EDR experience.","prompt_version":"v1"}')
+
+          RUN_ID=$(python -c "import json,sys; print(json.loads(sys.argv[1])['id'])" "$RUN_JSON")
+          curl -fsS -H "X-User-Id: ${X_USER_ID}" http://localhost:8000/v1/tailor-runs > /dev/null
+
+      - name: Show API log on failure
+        if: failure()
+        working-directory: services/api
+        run: |
+          echo "---- uvicorn.log ----"
+          test -f uvicorn.log && cat uvicorn.log || echo "No uvicorn.log found"
+
+name: CI
+
+on:
+  pull_request:
+    branches: [ "main", "master" ]
+  push:
+    branches: [ "main", "master" ]
+
+jobs:
+  python-quality:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Cache pre-commit
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-${{ runner.os }}-${{ hashFiles('.pre-commit-config.yaml') }}
+
+      - name: Install pre-commit
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r services/api/requirements-dev.txt
+
+      - name: Run pre-commit (all files)
+        run: |
+          pre-commit run --all-files --show-diff-on-failure
+
+  api-smoke:
+    needs: python-quality
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: rba
+          POSTGRES_PASSWORD: rba
+          POSTGRES_DB: rba
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U rba -d rba"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # Matches your app configuration
+      DATABASE_URL: postgresql+psycopg://rba:rba@localhost:5432/rba
+      ENV: ci
+      LOG_LEVEL: INFO
+      ARTIFACT_DIR: var/artifacts
+      # Optional: consistent user scoping for tests
+      X_USER_ID: 00000000-0000-0000-0000-000000000001
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install API dependencies
+        working-directory: services/api
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run migrations
+        working-directory: services/api
+        run: |
+          alembic upgrade head
+
+      - name: Start API (uvicorn)
+        working-directory: services/api
+        run: |
+          nohup uvicorn app.main:app --host 0.0.0.0 --port 8000 > uvicorn.log 2>&1 &
+          # Basic wait loop (no external deps)
+          for i in {1..30}; do
+            if curl -fsS http://localhost:8000/health > /dev/null; then
+              echo "API is up"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "API failed to start"
+          echo "---- uvicorn.log ----"
+          cat uvicorn.log
+          exit 1
+
+      - name: Smoke tests (health + tailor + list + export pdf)
+        working-directory: services/api
+        run: |
+          # 1) Health
+          curl -fsS http://localhost:8000/health | python -c "import sys,json; print(json.load(sys.stdin))"
+
+          # 2) Create a tailor run
+          RUN_JSON=$(curl -fsS -X POST http://localhost:8000/v1/tailor \
+            -H "Content-Type: application/json" \
+            -H "X-User-Id: ${X_USER_ID}" \
+            -d '{"resume_text":"John Doe\nSecurity Analyst\nExperience: Incident triage and EDR response.","job_text":"We need a Security Analyst with SIEM, incident response, and EDR experience.","prompt_version":"v1"}')
+
+          RUN_ID=$(python -c "import json,sys; print(json.loads(sys.argv[1])['id'])" "$RUN_JSON")
+          echo "RUN_ID=$RUN_ID"
+
+          # 3) List runs (expects pagination meta + no raw text)
+          LIST_JSON=$(curl -fsS -H "X-User-Id: ${X_USER_ID}" http://localhost:8000/v1/tailor-runs)
+          python - << 'PY'
+          import json,sys
+          d=json.loads(sys.stdin.read())
+          assert "items" in d and "meta" in d, "Missing items/meta in runs list response"
+          assert isinstance(d["items"], list), "items must be a list"
+          assert "total" in d["meta"], "meta.total missing"
+          print("runs list meta:", d["meta"])
+          PY <<< "$LIST_JSON"
+
+          # 4) Export PDF
+          EXPORT_JSON=$(curl -fsS -X POST \
+            -H "X-User-Id: ${X_USER_ID}" \
+            http://localhost:8000/v1/tailor-runs/${RUN_ID}/export/pdf)
+
+          ARTIFACT_ID=$(python -c "import json,sys; print(json.loads(sys.argv[1])['artifact_id'])" "$EXPORT_JSON")
+          DOWNLOAD_URL=$(python -c "import json,sys; print(json.loads(sys.argv[1])['download_url'])" "$EXPORT_JSON")
+          echo "ARTIFACT_ID=$ARTIFACT_ID"
+          echo "DOWNLOAD_URL=$DOWNLOAD_URL"
+
+          # 5) Download artifact and confirm it looks like a PDF
+          curl -fsS -L -H "X-User-Id: ${X_USER_ID}" "http://localhost:8000${DOWNLOAD_URL}" -o artifact.pdf
+          python - << 'PY'
+          with open("artifact.pdf","rb") as f:
+            head=f.read(5)
+          assert head == b"%PDF-", f"Expected PDF header, got {head!r}"
+          print("PDF download OK")
+          PY
+
+      - name: Show API log on failure
+        if: failure()
+        working-directory: services/api
+        run: |
+          echo "---- uvicorn.log ----"
+          test -f uvicorn.log && cat uvicorn.log || echo "No uvicorn.log found"
+
+Option 1 (Recommended): Makefile at repo root
+# Repo root Makefile
+# Usage:
+#   make help
+#   make install-dev
+#   make check
+#   make api
+#   make smoke
+
+API_DIR := services/api
+WEB_DIR := apps/web
+
+PYTHON ?= python3
+PIP ?= pip3
+
+REQ := $(API_DIR)/requirements.txt
+DEV_REQ := $(API_DIR)/requirements-dev.txt
+
+X_USER_ID ?= 00000000-0000-0000-0000-000000000001
+API_URL ?= http://localhost:8000
+
+.PHONY: help
+help:
+	@echo "Targets:"
+	@echo "  install-api        Install API runtime deps"
+	@echo "  install-dev        Install API runtime + dev deps (pre-commit/ruff/black/mypy)"
+	@echo "  precommit-install  Install git hooks (pre-commit install)"
+	@echo "  check              Run the exact same checks as CI (pre-commit --all-files)"
+	@echo "  lint               Ruff lint"
+	@echo "  fmt                Black format (writes changes)"
+	@echo "  fmt-check          Black format check (no changes)"
+	@echo "  type               Mypy type check"
+	@echo "  db-up              Start Postgres via docker compose"
+	@echo "  migrate            Run Alembic migrations (upgrade head)"
+	@echo "  api                Start the API (uvicorn)"
+	@echo "  smoke              Local smoke test similar to CI (requires API running)"
+
+.PHONY: install-api
+install-api:
+	$(PYTHON) -m pip install --upgrade pip
+	$(PIP) install -r $(REQ)
+
+.PHONY: install-dev
+install-dev:
+	$(PYTHON) -m pip install --upgrade pip
+	$(PIP) install -r $(REQ)
+	$(PIP) install -r $(DEV_REQ)
+
+.PHONY: precommit-install
+precommit-install:
+	pre-commit install
+
+.PHONY: check
+check:
+	pre-commit run --all-files --show-diff-on-failure
+
+.PHONY: lint
+lint:
+	cd $(API_DIR) && ruff check .
+
+.PHONY: fmt
+fmt:
+	cd $(API_DIR) && black .
+
+.PHONY: fmt-check
+fmt-check:
+	cd $(API_DIR) && black --check .
+
+.PHONY: type
+type:
+	cd $(API_DIR) && mypy app
+
+.PHONY: db-up
+db-up:
+	docker compose up -d db
+
+.PHONY: migrate
+migrate:
+	cd $(API_DIR) && alembic upgrade head
+
+.PHONY: api
+api:
+	cd $(API_DIR) && uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+
+.PHONY: smoke
+smoke:
+	@echo "Health check..."
+	curl -fsS $(API_URL)/health > /dev/null
+	@echo "Creating tailor run..."
+	@RUN_JSON=$$(curl -fsS -X POST $(API_URL)/v1/tailor \
+		-H "Content-Type: application/json" \
+		-H "X-User-Id: $(X_USER_ID)" \
+		-d '{"resume_text":"John Doe\nSecurity Analyst\nExperience: Incident triage and EDR response.","job_text":"We need a Security Analyst with SIEM, incident response, and EDR experience.","prompt_version":"v1"}'); \
+	RUN_ID=$$($(PYTHON) -c "import json,sys; print(json.loads(sys.argv[1])['id'])" "$$RUN_JSON"); \
+	echo "RUN_ID=$$RUN_ID"; \
+	echo "Listing runs..."; \
+	curl -fsS -H "X-User-Id: $(X_USER_ID)" $(API_URL)/v1/tailor-runs > /dev/null; \
+	echo "Exporting PDF..."; \
+	EXPORT_JSON=$$(curl -fsS -X POST -H "X-User-Id: $(X_USER_ID)" $(API_URL)/v1/tailor-runs/$$RUN_ID/export/pdf); \
+	DOWNLOAD_URL=$$($(PYTHON) -c "import json,sys; print(json.loads(sys.argv[1])['download_url'])" "$$EXPORT_JSON"); \
+	curl -fsS -L -H "X-User-Id: $(X_USER_ID)" "$(API_URL)$$DOWNLOAD_URL" -o artifact.pdf; \
+	$(PYTHON) -c "h=open('artifact.pdf','rb').read(5); assert h==b'%PDF-', f'Expected PDF header, got {h!r}'; print('PDF download OK')"
+
+Option 2 (Optional): justfile at repo root
+
+If you prefer just (cleaner UX), add this:
+
+# Repo root justfile
+# Install just: https://github.com/casey/just
+
+api_dir := "services/api"
+x_user_id := "00000000-0000-0000-0000-000000000001"
+api_url := "http://localhost:8000"
+
+install-api:
+  cd {{api_dir}} && python -m pip install --upgrade pip
+  cd {{api_dir}} && pip install -r requirements.txt
+
+install-dev:
+  cd {{api_dir}} && python -m pip install --upgrade pip
+  cd {{api_dir}} && pip install -r requirements.txt
+  cd {{api_dir}} && pip install -r requirements-dev.txt
+
+precommit-install:
+  pre-commit install
+
+check:
+  pre-commit run --all-files --show-diff-on-failure
+
+lint:
+  cd {{api_dir}} && ruff check .
+
+fmt:
+  cd {{api_dir}} && black .
+
+type:
+  cd {{api_dir}} && mypy app
+
+db-up:
+  docker compose up -d db
+
+migrate:
+  cd {{api_dir}} && alembic upgrade head
+
+api:
+  cd {{api_dir}} && uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+
+smoke:
+  curl -fsS {{api_url}}/health > /dev/null
+  RUN_JSON=$(curl -fsS -X POST {{api_url}}/v1/tailor \
+    -H "Content-Type: application/json" \
+    -H "X-User-Id: {{x_user_id}}" \
+    -d '{"resume_text":"John Doe\nSecurity Analyst\nExperience: Incident triage and EDR response.","job_text":"We need a Security Analyst with SIEM, incident response, and EDR experience.","prompt_version":"v1"}')
+  RUN_ID=$(python -c "import json,sys; print(json.loads(sys.argv[1])['id'])" "$RUN_JSON")
+  curl -fsS -H "X-User-Id: {{x_user_id}}" {{api_url}}/v1/tailor-runs > /dev/null
+  EXPORT_JSON=$(curl -fsS -X POST -H "X-User-Id: {{x_user_id}}" {{api_url}}/v1/tailor-runs/${RUN_ID}/export/pdf)
+  DOWNLOAD_URL=$(python -c "import json,sys; print(json.loads(sys.argv[1])['download_url'])" "$EXPORT_JSON")
+  curl -fsS -L -H "X-User-Id: {{x_user_id}}" "{{api_url}}${DOWNLOAD_URL}" -o artifact.pdf
+  python -c "h=open('artifact.pdf','rb').read(5); assert h==b'%PDF-'; print('PDF download OK')"
+
+1) Add Makefile (repo root)
+# Repo root Makefile
+# Primary workflow:
+#   make install-dev
+#   make precommit-install
+#   make check   # exact same checks as CI
+
+API_DIR := services/api
+
+PYTHON ?= python3
+PIP ?= pip3
+
+REQ := $(API_DIR)/requirements.txt
+DEV_REQ := $(API_DIR)/requirements-dev.txt
+
+X_USER_ID ?= 00000000-0000-0000-0000-000000000001
+API_URL ?= http://localhost:8000
+
+.PHONY: help
+help:
+	@echo "Targets:"
+	@echo "  install-api        Install API runtime deps"
+	@echo "  install-dev        Install API runtime + dev deps (pre-commit/ruff/black/mypy)"
+	@echo "  precommit-install  Install git hooks (pre-commit install)"
+	@echo "  check              Run the exact same checks as CI (pre-commit --all-files)"
+	@echo "  db-up              Start Postgres via docker compose"
+	@echo "  migrate            Run Alembic migrations (upgrade head)"
+	@echo "  api                Start the API (uvicorn)"
+	@echo "  smoke              Local smoke test similar to CI (requires API running)"
+
+.PHONY: install-api
+install-api:
+	$(PYTHON) -m pip install --upgrade pip
+	$(PIP) install -r $(REQ)
+
+.PHONY: install-dev
+install-dev:
+	$(PYTHON) -m pip install --upgrade pip
+	$(PIP) install -r $(REQ)
+	$(PIP) install -r $(DEV_REQ)
+
+.PHONY: precommit-install
+precommit-install:
+	pre-commit install
+
+.PHONY: check
+check:
+	pre-commit run --all-files --show-diff-on-failure
+
+.PHONY: db-up
+db-up:
+	docker compose up -d db
+
+.PHONY: migrate
+migrate:
+	cd $(API_DIR) && alembic upgrade head
+
+.PHONY: api
+api:
+	cd $(API_DIR) && uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+
+.PHONY: smoke
+smoke:
+	@echo "Health check..."
+	curl -fsS $(API_URL)/health > /dev/null
+	@echo "Creating tailor run..."
+	@RUN_JSON=$$(curl -fsS -X POST $(API_URL)/v1/tailor \
+		-H "Content-Type: application/json" \
+		-H "X-User-Id: $(X_USER_ID)" \
+		-d '{"resume_text":"John Doe\nSecurity Analyst\nExperience: Incident triage and EDR response.","job_text":"We need a Security Analyst with SIEM, incident response, and EDR experience.","prompt_version":"v1"}'); \
+	RUN_ID=$$($(PYTHON) -c "import json,sys; print(json.loads(sys.argv[1])['id'])" "$$RUN_JSON"); \
+	echo "RUN_ID=$$RUN_ID"; \
+	echo "Listing runs..."; \
+	curl -fsS -H "X-User-Id: $(X_USER_ID)" $(API_URL)/v1/tailor-runs > /dev/null; \
+	echo "Exporting PDF..."; \
+	EXPORT_JSON=$$(curl -fsS -X POST -H "X-User-Id: $(X_USER_ID)" $(API_URL)/v1/tailor-runs/$$RUN_ID/export/pdf); \
+	DOWNLOAD_URL=$$($(PYTHON) -c "import json,sys; print(json.loads(sys.argv[1])['download_url'])" "$$EXPORT_JSON"); \
+	curl -fsS -L -H "X-User-Id: $(X_USER_ID)" "$(API_URL)$$DOWNLOAD_URL" -o artifact.pdf; \
+	$(PYTHON) -c "h=open('artifact.pdf','rb').read(5); assert h==b'%PDF-', f'Expected PDF header, got {h!r}'; print('PDF download OK')"
+
+2) Add a small README snippet (optional, but helpful)
+
+Paste into your README (e.g., under “Development”):
+
+### Local quality checks (same as CI)
+
+```bash
+make install-dev
+make precommit-install
+make check
+
+
+---
+
+## 3) “Gold path” local flow (optional but strong)
+For a clean demo:
+
+```bash
+make install-dev
+make precommit-install
+make db-up
+make migrate
+make api
+# in another terminal
+make smoke
+
+Create: docs/DEVELOPMENT.md
+
+# Development Guide
+
+This repo contains a Resume Builder AI API and (optionally) a web app. The API handles sensitive user content (resume text and job postings), so the project emphasizes:
+
+- **PII-safe defaults** (no raw resume/job text in list responses by default)
+- **Auth-ready scoping** (all data scoped by `user_id`)
+- **Repeatable checks** (local checks match CI exactly)
+
+---
+
+## Prerequisites
+
+- Python 3.11+
+- Node.js 20+ (if running the web app)
+- Docker + Docker Compose
+- GNU Make (recommended)
+
+---
+
+## Quickstart
+
+### 1) Install dependencies + enable hooks
+From repo root:
+
+```bash
+make install-dev
+make precommit-install
+
+2) Run local checks (exactly matches CI)
+make check
+
+
+This runs pre-commit run --all-files, which includes formatting, linting, and type checks configured in .pre-commit-config.yaml.
+
+Database (Postgres) + Migrations
+Start Postgres
+make db-up
+
+Apply migrations
+make migrate
+
+
+Migrations use Alembic and must remain upgrade-safe:
+
+cd services/api
+alembic upgrade head
+
+Running the API locally
+make api
+
+
+By default the API runs at:
+
+http://localhost:8000
+
+Local smoke test (end-to-end)
+
+With the API running, in a second terminal:
+
+make smoke
+
+
+This performs:
+
+health check
+
+create a tailor run
+
+list runs
+
+export PDF
+
+download the PDF and validate the %PDF- header
+
+CI (GitHub Actions)
+
+CI runs two jobs:
+
+1) python-quality
+
+Runs pre-commit run --all-files to enforce the exact same checks contributors run locally.
+
+2) api-smoke
+
+starts Postgres (GitHub Actions service)
+
+installs API dependencies
+
+runs alembic upgrade head
+
+starts the API via uvicorn
+
+runs smoke tests:
+
+health check
+
+create tailor run
+
+list runs
+
+export PDF + download
+
+api-smoke depends on python-quality via needs: so quality checks fail fast before spinning up services.
+
+Auth note (development placeholder)
+
+During MVP hardening, the API uses a development placeholder header:
+
+X-User-Id: used to scope reads/writes per user (user_id)
+
+Future auth: Replace X-User-Id with JWT-based authentication and use the authenticated subject ID (sub) as user_id.
+
+Project standards (what reviewers should expect)
+
+Small PRs with clear scope (“one PR per step” for hardening work)
+
+PII-safe API defaults (no raw_text in list endpoints)
+
+Stable ordering for list endpoints (e.g., created_at DESC, id DESC)
+
+Schema changes always include an Alembic migration
+
+Local make check matches CI behavior
+
+
+If you want, I can also generate a `docs/ARCHITECTURE.md` with a clean diagram-style explanation of the API layers (routes → schemas → repos → DB) and the artifact export flow—excellent for interviews.
+
+Create: docs/ARCHITECTURE.md
+
+# Architecture
+
+Resume Builder AI is structured as a small, layered API designed for maintainability, testability, and safe handling of sensitive user content (PII). This document describes the system boundaries, core layers, and the artifact export workflow.
+
+---
+
+## High-level goals
+
+1. **PII-safe defaults**
+   - List endpoints return summaries and metadata.
+   - Full resume/job text is only returned by detail endpoints (explicit access).
+
+2. **Auth-ready user scoping**
+   - Every persisted object belongs to a user (`user_id`).
+   - During MVP, `X-User-Id` is a development placeholder.
+   - Future: swap in JWT and use `sub` as `user_id`.
+
+3. **Repeatable correctness**
+   - Migrations are first-class (Alembic).
+   - Local checks (`make check`) match CI behavior.
+   - Smoke tests validate migrations + runtime behavior end-to-end.
+
+---
+
+## System overview
+
+### Components
+- **API (FastAPI)**
+  - HTTP endpoints, request/response schemas, orchestration.
+- **Database (Postgres)**
+  - Stores resumes, job postings, runs, and export artifacts.
+- **Artifact storage**
+  - File-backed exports (e.g., PDF/DOCX) stored on disk (or object storage in future).
+
+### Data boundary
+The API is responsible for:
+- enforcing user scoping (`user_id`)
+- enforcing PII minimization defaults
+- ensuring export artifacts are created and retrievable safely
+
+---
+
+## Layering
+
+The API follows a deliberate separation of concerns:
+
+
+
+HTTP Request
+|
+v
+Routes (FastAPI)
+|
+v
+Schemas (Pydantic)
+|
+v
+Repositories (DB access)
+|
+v
+Database (Postgres)
+
+
+### 1) Routes (FastAPI)
+**Responsibilities**
+- Define endpoints and HTTP semantics (status codes, auth/user dependency).
+- Validate request data using schemas.
+- Orchestrate calls into the repository layer.
+- Return response schemas (never raw ORM objects).
+
+**Non-goals**
+- No direct SQL/ORM queries.
+- No business logic that can’t be unit-tested outside the web layer.
+
+### 2) Schemas (Pydantic)
+**Responsibilities**
+- Define request/response contracts.
+- Enforce PII-safe defaults through response shapes (e.g., summary vs detail models).
+- Provide stable, explicit API behavior to consumers.
+
+**Typical patterns**
+- `*CreateRequest` for POST payloads
+- `*Summary` for list endpoints
+- `*Detail` for detail endpoints
+
+### 3) Repositories (DB access)
+**Responsibilities**
+- Encapsulate all DB reads/writes.
+- Enforce:
+  - `user_id` scoping (cross-user reads blocked)
+  - `deleted_at` filtering (soft deletes)
+  - stable ordering for list results (e.g., `created_at DESC, id DESC`)
+- Provide a clean contract for routes to call.
+
+**Non-goals**
+- No HTTP or schema concerns.
+- No file system operations (exports handled in service layer or route orchestration).
+
+### 4) Database (Postgres)
+**Responsibilities**
+- Durable persistence with constraints, indexes, and migrations.
+- Ensures schema correctness and supports stable querying.
+
+---
+
+## Core data model (conceptual)
+
+> Field names are illustrative; see actual models/migrations for canonical definitions.
+
+### Resumes
+- `id`
+- `user_id`
+- `title`
+- `raw_text` (PII; not returned in list endpoints)
+- `created_at`, `updated_at`
+- `deleted_at` (soft delete)
+
+### Job postings
+- `id`
+- `user_id`
+- `source` / `title` / `company` (optional metadata)
+- `raw_text` (PII; not returned in list endpoints)
+- `created_at`, `updated_at`
+- `deleted_at`
+
+### Tailor runs
+- `id`
+- `user_id`
+- `resume_id` / `job_id` (or embedded text references)
+- `prompt_version`
+- `output_text` (tailored result)
+- `created_at`
+- `deleted_at`
+
+### Artifacts (exports)
+- `id`
+- `user_id`
+- `run_id`
+- `kind` (e.g., `pdf`, `docx`)
+- `storage_path` (local file path or object key)
+- `created_at`
+- `deleted_at`
+
+---
+
+## Soft deletes
+
+The system uses soft deletes to reduce risk when handling PII:
+- `deleted_at IS NULL` = active
+- `deleted_at IS NOT NULL` = deleted
+
+**Repository rule**
+All queries that return user-visible objects must include:
+- `WHERE user_id = :current_user_id`
+- `AND deleted_at IS NULL`
+
+---
+
+## Stable ordering
+
+List endpoints should return deterministic results:
+- `ORDER BY created_at DESC, id DESC`
+
+This prevents unstable pagination and reduces UI flicker.
+
+---
+
+## Artifact export flow (PDF/DOCX)
+
+### Sequence diagram (logical)
+
+
+
+Client
+|
+| POST /v1/tailor-runs/{run_id}/export/pdf
+v
+Routes
+
+validate user_id from get_current_user_id()
+
+load run (scoped to user, not deleted)
+
+render file (PDF/DOCX)
+
+write file to ARTIFACT_DIR
+
+create artifact row (user_id, run_id, kind, storage_path)
+
+return artifact_id + download_url
+|
+v
+Client downloads:
+GET /v1/artifacts/{artifact_id}/download
+
+validate user_id
+
+load artifact (scoped + not deleted)
+
+stream file
+
+
+### Key invariants
+- Export endpoints must **not** create artifacts for runs owned by other users.
+- Download endpoints must **not** serve artifacts owned by other users.
+- List endpoints for artifacts should return metadata only (no file bytes inline).
+
+---
+
+## Authentication roadmap
+
+Current MVP:
+- `X-User-Id` header acts as a development placeholder for `user_id`.
+
+Future:
+- Replace with JWT (Authorization: Bearer).
+- Extract `sub` and use it as `user_id`.
+- Remove reliance on `X-User-Id` once auth is fully integrated.
+
+---
+
+## Quality gates
+
+### Local
+- `make check` runs `pre-commit run --all-files`
+- Intended to match CI exactly
+
+### CI
+- `python-quality`: runs `pre-commit` checks
+- `api-smoke`: runs migrations + starts API + smoke tests
+
+---
+
+## Extension points (future-friendly)
+
+- Replace local artifact storage with S3/GCS (store object key in `storage_path`)
+- Add background job queue for exports (Celery/RQ) if exports become heavy
+- Add rate limiting / request IDs / structured logging
+- Add stricter type checking once the codebase stabilizes (tighten mypy)
+
+Mermaid diagram (architecture + layers)
+flowchart TB
+  Client[Client / Frontend / CLI] -->|HTTP| FastAPI[services/api/app/main.py\nFastAPI app]
+
+  subgraph API[services/api/app]
+    direction TB
+
+    Routes[Routes\nservices/api/app/routes/*.py]
+    Schemas[Schemas\nservices/api/app/schemas/*.py]
+    Deps[Dependencies\nservices/api/app/deps/*.py\nget_current_user_id()]
+    Repos[Repositories\nservices/api/app/repos/*.py]
+    Models[ORM Models\nservices/api/app/models/*.py]
+    Exporter[Export Service\nservices/api/app/services/exporter.py\n(PDF/DOCX renderer)]
+  end
+
+  FastAPI --> Routes
+  Routes --> Deps
+  Routes --> Schemas
+  Routes --> Repos
+  Repos --> Models
+
+  subgraph DB[Postgres]
+    PG[(Database)]
+  end
+
+  Models --> PG
+  Repos --> PG
+
+  subgraph Migrations[services/api/alembic]
+    Alembic[Alembic\nmigrations + env.py]
+  end
+
+  Alembic --> PG
+
+  subgraph Storage[Artifact Storage]
+    FS[(ARTIFACT_DIR\nvar/artifacts)]
+  end
+
+  Routes -->|export request| Exporter
+  Exporter -->|write file| FS
+  Exporter -->|create artifact row| Repos
+
+
+Folder-name tailoring note:
+If your repo uses different names (e.g., app/api/routes instead of app/routes), just update the labels inside the boxes—the diagram logic remains identical.
+
+Mermaid sequence diagram (artifact export flow)
+sequenceDiagram
+  autonumber
+  participant C as Client
+  participant R as Routes (FastAPI)
+  participant D as Deps (get_current_user_id)
+  participant Repo as Repos
+  participant DB as Postgres
+  participant X as Exporter (PDF/DOCX)
+  participant FS as ARTIFACT_DIR (files)
+
+  C->>R: POST /v1/tailor-runs/{run_id}/export/pdf
+  R->>D: get_current_user_id()
+  D-->>R: user_id
+
+  R->>Repo: get_run(run_id, user_id)
+  Repo->>DB: SELECT run WHERE id=run_id AND user_id=user_id AND deleted_at IS NULL
+  DB-->>Repo: run row
+  Repo-->>R: run
+
+  R->>X: render_pdf(run)
+  X->>FS: write file (artifact.pdf)
+  FS-->>X: storage_path
+
+  R->>Repo: create_artifact(run_id, user_id, kind=pdf, storage_path)
+  Repo->>DB: INSERT artifact row
+  DB-->>Repo: artifact row (artifact_id)
+  Repo-->>R: artifact_id
+
+  R-->>C: 200 {artifact_id, download_url}
+
+  C->>R: GET /v1/artifacts/{artifact_id}/download
+  R->>D: get_current_user_id()
+  D-->>R: user_id
+  R->>Repo: get_artifact(artifact_id, user_id)
+  Repo->>DB: SELECT artifact WHERE id=... AND user_id=... AND deleted_at IS NULL
+  DB-->>Repo: artifact row
+  Repo-->>R: artifact (storage_path)
+  R->>FS: read/stream file
+  FS-->>R: bytes
+  R-->>C: PDF stream
+
+ASCII fallback (quick “at a glance”)
+Client
+  |
+  | HTTP
+  v
+FastAPI app (services/api/app/main.py)
+  |
+  v
+Routes (services/api/app/routes/*.py)
+  |        \
+  |         -> Dependencies (services/api/app/deps/*.py) -> user_id
+  v
+Schemas (services/api/app/schemas/*.py)  [request/response contracts]
+  |
+  v
+Repositories (services/api/app/repos/*.py)  [user scoping + deleted_at filtering]
+  |
+  v
+Models (services/api/app/models/*.py)
+  |
+  v
+Postgres (DB)  <-- Alembic migrations (services/api/alembic)
+
+Export flow:
+Routes -> Exporter -> ARTIFACT_DIR (file) -> Repos -> DB (artifact row) -> download endpoint
+
+Optional: embed just the diagram in README
+
+If you want your README to show the visual without clutter, add a small section:
+
+## Architecture (at a glance)
+See `docs/ARCHITECTURE.md` for full details.
+
+```mermaid
+<!-- paste the flowchart here -->
+
+
+If you paste your actual `services/api/app/` tree (just the folder names), I’ll rewrite the diagram labels to match your repo *exactly* (including your real module paths).
+
+Mermaid diagram (architecture + layers)
+flowchart TB
+  Client[Client / Frontend / CLI] -->|HTTP| FastAPI[services/api/app/main.py\nFastAPI app]
+
+  subgraph API[services/api/app]
+    direction TB
+
+    Routes[Routes\nservices/api/app/routes/*.py]
+    Schemas[Schemas\nservices/api/app/schemas/*.py]
+    Deps[Dependencies\nservices/api/app/deps/*.py\nget_current_user_id()]
+    Repos[Repositories\nservices/api/app/repos/*.py]
+    Models[ORM Models\nservices/api/app/models/*.py]
+    Exporter[Export Service\nservices/api/app/services/exporter.py\n(PDF/DOCX renderer)]
+  end
+
+  FastAPI --> Routes
+  Routes --> Deps
+  Routes --> Schemas
+  Routes --> Repos
+  Repos --> Models
+
+  subgraph DB[Postgres]
+    PG[(Database)]
+  end
+
+  Models --> PG
+  Repos --> PG
+
+  subgraph Migrations[services/api/alembic]
+    Alembic[Alembic\nmigrations + env.py]
+  end
+
+  Alembic --> PG
+
+  subgraph Storage[Artifact Storage]
+    FS[(ARTIFACT_DIR\nvar/artifacts)]
+  end
+
+  Routes -->|export request| Exporter
+  Exporter -->|write file| FS
+  Exporter -->|create artifact row| Repos
+
+
+Folder-name tailoring note:
+If your repo uses different names (e.g., app/api/routes instead of app/routes), just update the labels inside the boxes—the diagram logic remains identical.
+
+Mermaid sequence diagram (artifact export flow)
+sequenceDiagram
+  autonumber
+  participant C as Client
+  participant R as Routes (FastAPI)
+  participant D as Deps (get_current_user_id)
+  participant Repo as Repos
+  participant DB as Postgres
+  participant X as Exporter (PDF/DOCX)
+  participant FS as ARTIFACT_DIR (files)
+
+  C->>R: POST /v1/tailor-runs/{run_id}/export/pdf
+  R->>D: get_current_user_id()
+  D-->>R: user_id
+
+  R->>Repo: get_run(run_id, user_id)
+  Repo->>DB: SELECT run WHERE id=run_id AND user_id=user_id AND deleted_at IS NULL
+  DB-->>Repo: run row
+  Repo-->>R: run
+
+  R->>X: render_pdf(run)
+  X->>FS: write file (artifact.pdf)
+  FS-->>X: storage_path
+
+  R->>Repo: create_artifact(run_id, user_id, kind=pdf, storage_path)
+  Repo->>DB: INSERT artifact row
+  DB-->>Repo: artifact row (artifact_id)
+  Repo-->>R: artifact_id
+
+  R-->>C: 200 {artifact_id, download_url}
+
+  C->>R: GET /v1/artifacts/{artifact_id}/download
+  R->>D: get_current_user_id()
+  D-->>R: user_id
+  R->>Repo: get_artifact(artifact_id, user_id)
+  Repo->>DB: SELECT artifact WHERE id=... AND user_id=... AND deleted_at IS NULL
+  DB-->>Repo: artifact row
+  Repo-->>R: artifact (storage_path)
+  R->>FS: read/stream file
+  FS-->>R: bytes
+  R-->>C: PDF stream
+
+ASCII fallback (quick “at a glance”)
+Client
+  |
+  | HTTP
+  v
+FastAPI app (services/api/app/main.py)
+  |
+  v
+Routes (services/api/app/routes/*.py)
+  |        \
+  |         -> Dependencies (services/api/app/deps/*.py) -> user_id
+  v
+Schemas (services/api/app/schemas/*.py)  [request/response contracts]
+  |
+  v
+Repositories (services/api/app/repos/*.py)  [user scoping + deleted_at filtering]
+  |
+  v
+Models (services/api/app/models/*.py)
+  |
+  v
+Postgres (DB)  <-- Alembic migrations (services/api/alembic)
+
+Export flow:
+Routes -> Exporter -> ARTIFACT_DIR (file) -> Repos -> DB (artifact row) -> download endpoint
+
+Optional: embed just the diagram in README
+
+If you want your README to show the visual without clutter, add a small section:
+
+## Architecture (at a glance)
+See `docs/ARCHITECTURE.md` for full details.
+
+```mermaid
+<!-- paste the flowchart here -->
+
+
+If you paste your actual `services/api/app/` tree (just the folder names), I’ll rewrite the diagram labels to match your repo *exactly* (including your real module paths).
+
+Run one of the commands below and paste the output here.
+
+macOS/Linux (repo root)
+find services/api/app -maxdepth 2 -type d | sort
+
+Windows PowerShell (repo root)
+Get-ChildItem -Directory -Recurse services\api\app | Select-Object -ExpandProperty FullName
+
